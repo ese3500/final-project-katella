@@ -1,0 +1,327 @@
+/*
+ * full_operation.c
+ *
+ * Created: 05/05/2023 04:56:39
+ * Author : DELL
+ */ 
+
+#include <avr/io.h>
+#include <stdio.h>
+#include <avr/interrupt.h>
+#define F_CPU 16000000UL
+#define BAUD_RATE 9600
+#define BAUD_PRESCALER (((F_CPU / (BAUD_RATE * 16UL))) - 1)
+#include <util/delay.h>
+#include "uart.h"
+
+int min_dc = 3; 
+int max_dc = 30;
+int stop_dc = 0;
+
+int state = 0;
+// state = 0 : stop
+// state = 1 : min_dc
+// state = 2 : max_dc
+
+int press2 = 0;
+// press2 = 0 --> 1: press 1
+// press2 = 2 --> 3: press 2
+
+int press1 = 4;
+// press1 = 4 --> 5: press 1
+// press1 = 6 --> 7: press 2
+
+int top_left = 0x01;
+int top_right = 0x01;
+
+char* data_arr[64];
+char* drawer_arr[64];
+char* two_dim[8][8];
+int spdr;
+
+char String[25];
+
+void Initialize()
+{
+	cli();
+	
+	/********************
+	*** PWM + Clock 0 ***
+	***     SETUP     ***
+	*********************/
+	
+	DDRD |= (1 << DDD5); // set PD5 as output  --> connect to servo motor
+	
+	// prescaler = 1024 --> clock: 
+	TCCR0B |= (1<<CS00);
+	TCCR0B &= ~(1<<CS01);
+	TCCR0B |= (1<<CS02);
+	
+	// set timer0 to phase correct
+	TCCR0A |= (1 << WGM00);
+	TCCR0A &= ~(1 << WGM01);
+	TCCR0B |= (1 << WGM02);
+	
+	//Toggle OC0A on compare match
+	TCCR0A |= (1 << COM0A0);
+	TCCR0A &= ~(1 << COM0A1);
+	
+	//Clear OC0B on compare match when up-counting. Set OC0B on compare match when down-counting.
+	TCCR0A &= ~(1 << COM0B0);
+	TCCR0A |= (1 << COM0B1);
+	
+	OCR0A = 142; // 55Hz
+	OCR0B = 0; 
+	
+	// OCR0B = 3; // min
+	// OCR0B = 30; // max
+	// OCR0B = 0; //stop
+	
+	/********************
+	*** PWM + Clock 2 ***
+	***     SETUP     ***
+	*********************/
+	
+	// PD3 for output
+	DDRD |= (1 << DDD3);
+	
+	// prescaler = 1024 --> clock:
+	TCCR2B |= (1<<CS20);
+	TCCR2B |= (1<<CS21);
+	TCCR2B |= (1<<CS22);
+	
+	//phase correct pwm mode
+	TCCR2B |= (1 << WGM22);
+	TCCR2A &= ~(1 << WGM21);
+	TCCR2A |= (1 << WGM20);
+	
+	//Toggle OC2A on compare match
+	TCCR2A |= (1 << COM2A0);
+	
+	//clear OC2B when up-counting
+	TCCR2A |= (1 << COM2B1);
+	
+	OCR2A = 142;
+	OCR2B = 0;
+	
+	
+	/********************
+	***   LED SETUP   ***
+	*********************/
+	
+	DDRD |= (1 << DDD4);
+	DDRD |= (1 << DDD2);
+	
+	/**********************************
+	 *** SET PIN CHANGE INTERRUPT 1 ***
+	 **********************************/
+	
+	// Pin Change Interrupt PD7
+	
+	PCICR |= (1 << PCIE2); // enable pin change interrupt 2
+	PCMSK2 |= (1 << PCINT23); // change on PD7 will cause interrupt.
+	
+	/**********************************
+	 *** SET PIN CHANGE INTERRUPT 2 ***
+	 **********************************/
+	
+	// Pin Change Interrupt PD
+	
+	PCICR |= (1 << PCIE1); // enable pin change interrupt 2
+	PCMSK1 |= (1 << PCINT8); // change on PC0 will cause interrupt.
+	
+	sei();
+	
+	
+}
+
+/*********************************************
+				SPI SETUP START
+**********************************************/
+
+void init_master() {
+	
+	// cs: PB10
+	// mosi: PB11 
+	// sck: PB13
+	
+	DDRB |= (1 << DDB2) | (1 << DDB3) | (1 << DDB5); // set cs, mosi, sck pins as outputs
+	PORTB |= (1 << PORTB2);
+	
+	//SPCR |= (1 << SPIE); // enable spi interrupt
+	SPCR |= (1 << SPE); // enable spi
+	SPCR &= ~(1 << DORD); // MSB is transmitted first
+	SPCR |= (1 << MSTR); // master mode selected
+	SPCR &= ~(1 << CPOL); // clock polarity: low when idle
+	SPCR &= ~(1 << CPHA); // leading edge: rising
+	SPCR |= (1 << SPR0) | (1 << SPR1); //SCK = f_osc/128
+	//SPSR |= (1 << SPI2X);
+	
+}
+
+void send(char* data) {
+	
+	SPDR = (int) data; //write to data register
+ 	while (!(SPSR & (1 << SPIF))); //wait for end of transmission
+	
+	spdr = SPDR; 
+	sprintf(String, "data = %u\n", spdr);
+	UART_putstring(String);
+}
+
+void send_command(char* data) {
+	
+	//cs low 
+	PORTB &= ~(1 << PORTB2);
+	//delay 0.5ms
+	_delay_us(500);
+	//call send(data)
+	send(data);
+	//delay 0.5ms
+	_delay_us(500);
+	//cs high
+	PORTB |= (1 << PORTB2);
+	
+}
+
+
+void send_fullcommand(char* data[]) {
+	
+	// assert chip select
+	PORTB &= ~(1 << PORTB2);
+	//delay 0.5ms
+	_delay_us(500);
+	for (int i = 0; i < 64; i++) {
+		send(data[i]);
+	}
+	_delay_us(500);
+	//de-assert chip select
+	PORTB |= (1 << PORTB2);
+}
+
+void set_colors(int color0, int color1, int color2, int color3) {
+	
+	//color0 = top left
+	//color1 = top right
+	//color2 = bottom left
+	//color3 = bottom right
+	
+	int x = 0;
+	
+	for (int i = 0; i < 8; i++) {
+		for (int j = 0; j < 8; j++) {
+			if (j == 3 || j == 4 || i == 3 || i == 4) {
+				two_dim[i][j] = (char*) 0x00;
+				} else if (i >= 0 && i <= 2 && j >= 0 && j <= 2) { //top left
+					two_dim[i][j] = (char*) color0;
+				} else if (i >= 0 && i <= 2 && j >= 5 && j <= 7) { //top right 
+					two_dim[i][j] = (char*) color1;
+				} else if (i >= 5 && i <= 7 && j >= 0 && j <= 2) { //bottom left
+					two_dim[i][j] = (char*) color2;
+				} else if (i >= 5 && i <= 7 && j >= 5 && j <= 7) {//bottom right
+					two_dim[i][j] = (char*) color3;
+			}
+			drawer_arr[x] = two_dim[i][j];
+			x++;
+		}
+	}
+	
+	send_fullcommand(drawer_arr);
+}
+
+/*********************************************
+				SPI SETUP END
+**********************************************/
+
+ISR(PCINT2_vect) {
+	
+	PORTD ^= (1 << PORTD4);
+	
+	 if (press2 == 0) {
+		 press2 = 1;
+	 } else if(press2 == 2) {
+		 press2 = 3;
+	 }
+	 
+}
+
+ISR(PCINT1_vect) {
+	
+	PORTD ^= (1 << PORTD2);
+	
+	if (press1 == 4) {
+		press1 = 5;
+		} else if(press1 == 6) {
+		press1 = 7;
+	}
+	
+}
+
+void startup() {
+	set_colors(0x01,0x01,0x01,0x01);
+}
+
+int main(void)
+{
+	
+	UART_init(BAUD_PRESCALER);
+	
+	Initialize();
+	init_master();
+	startup();
+	
+	while (1) {
+		
+		sprintf(String, "press = %u \n", press2);
+		UART_putstring(String);
+		
+		//_delay_ms(1000);
+		
+		if(press2 == 1) {
+			set_colors(0x03,top_right,0x01,0x01); // orange top left
+			OCR0B = min_dc;
+			_delay_ms(450);
+			OCR0B = stop_dc;
+			set_colors(0x02,top_right,0x01,0x01); // red 
+			press2 = 2;
+			
+			top_left = 0x02; //set top_left to red.
+			
+		} else if(press2 == 3) {
+			set_colors(0x03,top_right,0x01,0x01);// orange
+			OCR0B = max_dc;
+			_delay_ms(550);
+			OCR0B = stop_dc;
+			set_colors(0x01,top_right,0x01,0x01);// green
+			press2 = 0;
+			
+			top_left = 0x01; //set top_left to green.
+			
+		} else if(press1 == 5) {
+			set_colors(top_left,0x03,0x01,0x01); // orange top left
+			//OCR0B = min_dc;
+			OCR2B = min_dc;
+			_delay_ms(450);
+			//OCR0B = stop_dc;
+			OCR2B = stop_dc;
+			set_colors(top_left,0x02,0x01,0x01); // red
+			press1 = 6;
+			
+			top_right = 0x02; //set top_right to red.
+			
+			} else if(press1 == 7) {
+			set_colors(top_left,0x03,0x01,0x01);// orange
+			//OCR0B = max_dc;
+			OCR2B = max_dc;
+			_delay_ms(550);
+			//OCR0B = stop_dc;
+			OCR2B = stop_dc;
+			set_colors(top_left,0x01,0x01,0x01);// green
+			press1 = 4;
+			
+			top_right = 0x01; // set top_right to green.
+			
+		}
+	
+	}
+}
